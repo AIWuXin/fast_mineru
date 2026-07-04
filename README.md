@@ -58,23 +58,3 @@ tools/             cmp_all_latex.py(精度对比)
 engines_bin/       预转好的 .engine
 tests/             pytest
 ```
-
-**无 monkey-patch**：`FastMineruPipeline.__init__` 里按 config 把 MFR head 的 `generate_export`
-一次性绑成 TRT 版，不靠运行时 `get_atom_model` 拦截、不用全局状态。
-
-## 混合项目构建(照搬 nemotron_infer)
-
-- `CMakeLists.txt`：`pybind11_add_module` + `CMAKE_CUDA_ARCHITECTURES 89 120`(RTX40/50) +
-  POST_BUILD 把 `.pyd` 和 `cudart64_*.dll` 拷进 `fast_mineru/csrc/`。
-- `tasks.py`(invoke)：`build-ext` 编 csrc、`build` 打 wheel + `retag` 平台标签、`gen-stub` 出 `.pyi`。
-- MSVC `/utf-8`，CUDA `--expt-relaxed-constexpr`。
-
-## 血泪教训(内化自源项目)
-
-- **别信隔离基准**：encoder 隔离 4.8x → 端到端仅 9%；batch=1 decoder "3.8x" 是 launch-bound 假象。
-  必须端到端实测占比。
-- **B>引擎 max_batch 必须拆块**(48→32+16 pad 拼接)，且不能在拆块前早退回 torch(源项目踩过死代码坑)。
-- **全程 GPU 零拷贝 + 专用非默认 stream**：present KV 直接 data_ptr 当下一步 past，消除
-  "Using default stream in enqueueV3" 告警且精度不变。
-
-详见 `../.context/fast_mineru_blueprint.md`。
