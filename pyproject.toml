@@ -1,0 +1,59 @@
+[project]
+name = "fast_mineru"
+version = "0.1.0"
+description = "MinerU 推理管线的原生加速封装：TensorRT MFR decoder(全程GPU零拷贝) + CUDA 预处理算子，无 monkey-patch，一个类一键推理"
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "numpy>=1.26",
+    "pybind11>=3.0",
+    "pybind11-stubgen<1",
+    "torch>=2.6,<3",
+    "rich>=13.0",
+    "tensorrt==10.12.0.36",
+    "pillow>=11.0.0",
+    # MinerU pipeline 后端(pp_formulanet/OCR/layout)——editable 路径见 [tool.uv.sources]
+    "mineru[pipeline]",
+    "six>=1.17.0",
+]
+
+# dev：构建 wheel(uv build + retag) / 生成 .pyi 存根 / 跑基准。
+[dependency-groups]
+dev = [
+    "invoke>=3.0",
+    "wheel>=0.45",
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fast_mineru*"]
+exclude = ["build*", "engines_bin*", "tests*", "third_party*"]
+
+# 打包编译产物(.pyd/.dll) + C 头文件(下游二次编译用)。
+[tool.setuptools.package-data]
+fast_mineru = [
+    "**/*.pyd", "**/*.dll",
+    "**/*.so", "**/*.dylib",
+    "**/include/**",
+    "**/*.pyi",
+]
+
+[project.scripts]
+fast-mineru = "fast_mineru.cli:main"
+
+# torch 从 PyTorch cu128 索引拉取(默认 PyPI 是 +cpu 轮子，GPU 编排不可用)。
+# mineru 走本地 editable(复用 D:/project/MinerU 源码树 + 其构建缓存)。
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+mineru = { path = "../MinerU", editable = true }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

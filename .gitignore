@@ -1,0 +1,30 @@
+# build
+_build/
+build/
+dist/
+*.egg-info/
+_stubgen_tmp/
+cmake-build-*/
+
+# compiled ext (rebuilt from csrc)
+fast_mineru/csrc/*.pyd
+fast_mineru/csrc/*.so
+fast_mineru/csrc/cudart64_*.dll
+
+# engines (large; build/download separately)
+engines_bin/*.engine
+*.engine
+*.onnx
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.python-version.local
+
+# ide
+.idea/
+.vscode/
+out/
+fast_mineru.egg-info/
+uv.lock
