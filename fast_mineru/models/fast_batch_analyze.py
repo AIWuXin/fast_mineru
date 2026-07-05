@@ -1,22 +1,24 @@
-"""FastBatchAnalyze —— 自己拥有 OCR 编排，OCR-det 段整页 GPU 常驻。
+"""FastBatchAnalyze -- own OCR orchestration with per-batch inline rec to keep VRAM bounded.
 
-背景：MinerU 的 BatchAnalyze 每次调用新建实例、OCR 段内联在 ~600 行 __call__ 里、无可覆写
-子方法。要把整页数据流搬上 GPU(每页 1 次 H2D 替代 N 次 per-crop H2D，crop/cvtColor/mask 上
-GPU，rec 文本行裁切 GPU 直通 CRNN TRT)，只能接管 __call__。
+Background: MinerU's BatchAnalyze creates a fresh instance each call, inlines OCR segments in a
+~600-line __call__ with no overridable sub-methods. To move the whole-page data flow to GPU
+(1 H2D per page instead of N per-crop H2Ds, crop/cvtColor/mask on GPU, rec text-line crop GPU
+direct to CRNN TRT), we must own __call__.
 
-设计原则(用户决策：自己重写这段编排，方便后续加速 + 不怕 mineru 升级)：
-- **照调 mineru**：layout/MFR/table/seal 段全部原样调用 mineru 函数(run_*_inference、
-  sorted_boxes/merge_det_boxes/update_det_boxes/get_adjusted_mfdetrec_res、get_res_list_from_layout_res、
-  _extract_table_inline_objects、_prune_empty_ocr_text_blocks、clean_vram……)。这些是升级敏感的纯
-  编排/后处理，无加速价值，全部复用。
-- **自己拥有(GPU)**：仅 OCR-det 段(~原版 line 702-840) —— 整页 H2D 常驻，ocr_crop_and_bgr +
-  ocr_apply_mask kernel，det 喂 FastTextDetector(GPU tensor 跳 H2D)，_gpu_get_ocr_result_list 产出
-  **已 resize_norm 的 [3,48,imgW] GPU tensor** 作为 np_img。
-- rec 段(收集 + 批推理)照抄 mineru：img_crop_list 里是 GPU tensor 时，FastTextRecognizer.__call__
-  会识别并直通 CRNN TRT(变宽分批 pad)，无需在此重写。
+Design (user decision: own the orchestration for future acceleration + mineru-upgrade safety):
+- **Call mineru**: layout/MFR/table/seal via mineru functions (run_*_inference, sorted_boxes,
+  merge_det_boxes, update_det_boxes, get_adjusted_mfdetrec_res, get_res_list_from_layout_res,
+  _extract_table_inline_objects, _prune_empty_ocr_text_blocks, clean_vram ...). These are
+  upgrade-sensitive pure orchestration/postprocessing with no accel value -- all reused.
+- **Own (GPU)**: OCR-det segment (~original line 702-840) -- whole-page H2D resident,
+  ocr_crop_and_bgr + ocr_apply_mask kernels, det feeds FastTextDetector (GPU tensor skips H2D),
+  _gpu_get_ocr_result_list produces pre-resize_norm'd [3,48,imgW] GPU tensors as np_img.
+  **Per-batch inline rec**: immediately after each det batch, run rec on the produced np_img
+  GPU tensors, pop them, torch.cuda.empty_cache() -- keeps VRAM peak at one batch, not the
+  whole page.
 
-移植自 D:/project/MinerU/fast_ops/fast_ops/patcher.py(去 monkey-patch 化)，含其踩过的坑修正
-(rot90 阈值用 TEXT_REC_ROTATE_RATIO=1.5，非早期误用的 0.75)。
+Ported from D:/project/MinerU/fast_ops/fast_ops/patcher.py (de-monkey-patched), with its
+fixed rot90 threshold (TEXT_REC_ROTATE_RATIO=1.5, not the earlier mistaken 0.75).
 """
 from __future__ import annotations
 
@@ -31,27 +33,23 @@ import torch
 from loguru import logger
 from tqdm import tqdm
 
-from mineru.backend.pipeline.batch_analyze import (
+# 所有 mineru 符号统一经 fast_mineru 的单一适配器边界导入（见 fast_mineru/mineru_backend.py），
+# 不再直连 mineru 内部模块路径 —— 逻辑一字不改，只换 import 来源。
+from ..mineru_backend import (
     BatchAnalyze,
     LAYOUT_BASE_BATCH_SIZE,
     MFR_BASE_BATCH_SIZE,
     OCR_DET_BASE_BATCH_SIZE,
     TABLE_Wired_Wireless_CLS_BATCH_SIZE,
-)
-from mineru.backend.pipeline.model_init import (
     AtomModelSingleton,
     run_layout_inference,
     run_mfr_inference,
     run_ocr_inference,
-)
-from mineru.backend.pipeline.model_list import AtomicModel
-from mineru.utils.bbox_utils import normalize_to_int_bbox
-from mineru.utils.model_utils import (
+    AtomicModel,
+    normalize_to_int_bbox,
     _get_int_bbox,
     clean_vram,
     get_res_list_from_layout_res,
-)
-from mineru.utils.ocr_utils import (
     OcrConfidence,
     TEXT_REC_ROTATE_RATIO,
     calculate_is_angle,
@@ -59,15 +57,17 @@ from mineru.utils.ocr_utils import (
     merge_det_boxes,
     sorted_boxes,
     update_det_boxes,
+    get_crop_np_img,
 )
-from mineru.utils.pdf_image_tools import get_crop_np_img
 
 from ..csrc import ocr_apply_mask, ocr_crop_and_bgr
 
 
+# ---- GPU helpers (ported from fast_ops patcher) ------------------------------
+
 def gpu_crop_text_line(src: torch.Tensor, points: np.ndarray, device) -> torch.Tensor:
-    """GPU 文本行裁切(透视变换)，返回 BGR uint8 [H,W,3]。匹配 cv2.warpPerspective +
-    BORDER_REPLICATE。轴对齐框走快速切片路径。移植自 fast_ops.patcher.gpu_crop_text_line。"""
+    """GPU perspective-warp crop for text line. Returns BGR uint8 [H,W,3].
+    Matches cv2.warpPerspective + BORDER_REPLICATE. Axis-aligned fast path."""
     import torch.nn.functional as F
 
     x_coords, y_coords = points[:, 0], points[:, 1]
@@ -113,8 +113,8 @@ def gpu_crop_text_line(src: torch.Tensor, points: np.ndarray, device) -> torch.T
 
 
 def gpu_resize_norm_text_line(img: torch.Tensor, imgW: int, device) -> torch.Tensor:
-    """GPU resize + /127.5-1 + pad → [3,48,imgW] float32。匹配 resize_norm_img。
-    移植自 fast_ops.patcher.gpu_resize_norm_text_line。"""
+    """GPU resize + /127.5-1 + pad -> [3,48,imgW] float32.
+    Matches resize_norm_img. Ported from fast_ops patcher."""
     import torch.nn.functional as F
 
     h, w = img.shape[:2]
@@ -133,14 +133,13 @@ def gpu_resize_norm_text_line(img: torch.Tensor, imgW: int, device) -> torch.Ten
 
 
 def _gpu_get_ocr_result_list(ocr_res, useful_list, ocr_enable, crop_bgr_gpu, lang, device):
-    """GPU 版 get_ocr_result_list —— 文本行在 GPU 裁切+resize_norm，np_img 存已预处理的
-    [3,48,imgW] GPU tensor(rec 段直通 CRNN TRT)。坐标转换/过滤逻辑 1:1 复刻 ocr_utils.get_ocr_result_list。
-    """
+    """GPU version of get_ocr_result_list -- text-line crop + resize_norm on GPU.
+    np_img stores preprocessed [3,48,imgW] GPU tensor for direct rec consumption.
+    Coordinate transform / filtering 1:1 mirrors ocr_utils.get_ocr_result_list."""
     paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
     ocr_result_list = []
 
     for box_ocr_res in ocr_res:
-        need_ocr_rec = False
         if len(box_ocr_res) == 2:
             p1, p2, p3, p4 = box_ocr_res[0]
             text, score = box_ocr_res[1]
@@ -171,8 +170,6 @@ def _gpu_get_ocr_result_list(ocr_res, useful_list, ocr_enable, crop_bgr_gpu, lan
                 text_crop = gpu_crop_text_line(crop_bgr_gpu, tmp_box, device)
                 if text_crop.shape[0] >= 2 and text_crop.shape[1] >= 2:
                     h, w = text_crop.shape[:2]
-                    # 对齐 get_rotate_crop_image(ocr_utils.py:493)：阈值 TEXT_REC_ROTATE_RATIO，
-                    # 方向 np.rot90 默认 k=1。(fast_ops 早期误用 0.75+k=-1 会把近方标题误旋，已修正)
                     if h > 0 and w > 0 and h * 1.0 / w >= TEXT_REC_ROTATE_RATIO:
                         text_crop = torch.rot90(text_crop, k=1, dims=[0, 1])
                     h, w = text_crop.shape[:2]
@@ -197,7 +194,7 @@ def _gpu_get_ocr_result_list(ocr_res, useful_list, ocr_enable, crop_bgr_gpu, lan
             "text": text,
         }
         if img_crop is not None:
-            ocr_item["np_img"] = img_crop   # GPU [3,48,imgW] fp32，rec 段直通
+            ocr_item["np_img"] = img_crop
             ocr_item["lang"] = lang
             ocr_item["_need_ocr_rec"] = True
         ocr_result_list.append(ocr_item)
@@ -205,26 +202,43 @@ def _gpu_get_ocr_result_list(ocr_res, useful_list, ocr_enable, crop_bgr_gpu, lan
     return ocr_result_list
 
 
+# ---- FastBatchAnalyze --------------------------------------------------------
+
 class FastBatchAnalyze(BatchAnalyze):
-    """覆写 __call__，仅 OCR-det 段替换为整页 GPU 常驻。其余段落原样调 mineru。"""
+    """Override __call__; OCR-det with per-batch inline rec to keep VRAM bounded."""
 
     def _gpu_ocr_det_segment(self, ocr_res_list_all_page, atom_model_manager):
-        """整页 GPU 常驻的 OCR-det 段。替换原版 __call__ line 702-798(text_ocr_det_batch_enabled
-        分支)。产出写入各页 layout_res。"""
-        from collections import defaultdict
+        """Whole-page GPU-resident OCR-det + per-batch inline rec.
+        Each det batch's np_img GPU tensors are immediately consumed by rec and freed
+        before the next batch starts -- VRAM peak = one batch, not the whole page."""
+        from ..mineru_backend import OcrConfidence as _OcrConf
 
         device = self.model.device
         mask_inline = self.mask_inline_formula_for_ocr_det
 
-        # Phase 1：遍历每页，整图 1 次 H2D，GPU crop+BGR+mask
-        all_cropped_images_info = []
+        lang_set = {d["lang"] for d in ocr_res_list_all_page}
+        ocr_models = {}
+        for lang in lang_set:
+            ocr_models[lang] = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.OCR, lang=lang
+            )
+
+        det_batch_size = max(1, self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
+
         for ocr_res_list_dict in ocr_res_list_all_page:
             _lang = ocr_res_list_dict["lang"]
-            np_img = ocr_res_list_dict["np_img"]
+            np_img_np = ocr_res_list_dict["np_img"]
+            ocr_model = ocr_models[_lang]
+
+            if not ocr_res_list_dict["ocr_res_list"]:
+                continue
+
+            # 1 H2D per page
             gpu_page = torch.from_numpy(
-                np.ascontiguousarray(np_img).copy()
+                np.ascontiguousarray(np_img_np).copy()
             ).to(device=device, dtype=torch.uint8)
 
+            page_crop_info = []
             for res in ocr_res_list_dict["ocr_res_list"]:
                 cx0, cy0, cx1, cy1 = _get_int_bbox(res)
                 paste_x, paste_y = 50, 50
@@ -232,54 +246,109 @@ class FastBatchAnalyze(BatchAnalyze):
                     paste_x, paste_y, cx0, cy0, cx1, cy1,
                     cx1 - cx0 + paste_x * 2, cy1 - cy0 + paste_y * 2,
                 ]
-                adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(
+                adj = get_adjusted_mfdetrec_res(
                     ocr_res_list_dict["single_page_mfdetrec_res"], useful_list
                 )
                 crop_bgr = ocr_crop_and_bgr(gpu_page, cx0, cy0, cx1, cy1, paste_x, paste_y)
-                if mask_inline and adjusted_mfdetrec_res:
-                    mask_boxes = [b["bbox"] for b in adjusted_mfdetrec_res]
+                if mask_inline and adj:
+                    mask_boxes = [b["bbox"] for b in adj]
                     mask_t = torch.tensor(mask_boxes, dtype=torch.int32, device=device)
                     ocr_apply_mask(crop_bgr, mask_t)
-                all_cropped_images_info.append(
-                    (crop_bgr, useful_list, ocr_res_list_dict, adjusted_mfdetrec_res, _lang)
-                )
+                page_crop_info.append((crop_bgr, useful_list, adj))
+
             del gpu_page
 
-        # Phase 2：按语言分组，GPU BGR tensor 直喂 FastTextDetector.batch_predict
-        lang_groups = defaultdict(list)
-        for info in all_cropped_images_info:
-            lang_groups[info[4]].append(info)
-
-        for lang, lang_crop_list in lang_groups.items():
-            if not lang_crop_list:
+            if not page_crop_info:
                 continue
-            ocr_model = atom_model_manager.get_atom_model(
-                atom_model_name=AtomicModel.OCR, lang=lang
-            )
-            batch_images = [info[0] for info in lang_crop_list]
-            det_batch_size = min(len(batch_images), self.batch_ratio * OCR_DET_BASE_BATCH_SIZE)
-            batch_results = run_ocr_inference(
-                ocr_model.text_detector.batch_predict,
-                batch_images, det_batch_size,
-                tqdm_enable=True, tqdm_desc=f"OCR-det {lang}",
-            )
-            for info, (dt_boxes, _) in zip(lang_crop_list, batch_results):
-                crop_bgr_gpu, useful_list, ocr_res_list_dict, adjusted_mfdetrec_res, _lang = info
-                if dt_boxes is not None and len(dt_boxes) > 0:
-                    dt_boxes_sorted = sorted_boxes(dt_boxes)
-                    dt_boxes_merged = merge_det_boxes(dt_boxes_sorted) if dt_boxes_sorted else []
-                    dt_boxes_final = (
-                        update_det_boxes(dt_boxes_merged, adjusted_mfdetrec_res)
-                        if dt_boxes_merged and adjusted_mfdetrec_res else dt_boxes_merged
-                    )
-                    if dt_boxes_final:
-                        ocr_res = [box.tolist() if hasattr(box, "tolist") else box
-                                   for box in dt_boxes_final]
-                        ocr_result_list = _gpu_get_ocr_result_list(
-                            ocr_res, useful_list, ocr_res_list_dict["ocr_enable"],
-                            crop_bgr_gpu, _lang, device,
+
+            total = len(page_crop_info)
+            for start in range(0, total, det_batch_size):
+                end = min(start + det_batch_size, total)
+                batch_slice = page_crop_info[start:end]
+                batch_images = [x[0] for x in batch_slice]
+                batch_results = run_ocr_inference(
+                    ocr_model.text_detector.batch_predict,
+                    batch_images, len(batch_slice),
+                    tqdm_enable=True, tqdm_desc=f"OCR-det {_lang}",
+                )
+
+                # Collect rec candidates (GPU np_img tensors) from this batch
+                batch_rec_candidates = []
+                for (crop_bgr_gpu, useful_list, adj), (dt_boxes, _) \
+                        in zip(batch_slice, batch_results):
+                    if dt_boxes is not None and len(dt_boxes) > 0:
+                        dt_sorted = sorted_boxes(dt_boxes)
+                        dt_merged = merge_det_boxes(dt_sorted) if dt_sorted else []
+                        dt_final = (
+                            update_det_boxes(dt_merged, adj)
+                            if dt_merged and adj else dt_merged
                         )
-                        ocr_res_list_dict["layout_res"].extend(ocr_result_list)
+                        if dt_final:
+                            ocr_res = [box.tolist() if hasattr(box, "tolist") else box
+                                       for box in dt_final]
+                            result = _gpu_get_ocr_result_list(
+                                ocr_res, useful_list, ocr_res_list_dict["ocr_enable"],
+                                crop_bgr_gpu, _lang, device,
+                            )
+                            for item in result:
+                                if item.get("_need_ocr_rec") and "np_img" in item:
+                                    batch_rec_candidates.append(item)
+                                ocr_res_list_dict["layout_res"].append(item)
+
+                # Free this batch's crop BGR tensors
+                for crop_bgr, _, _ in batch_slice:
+                    del crop_bgr
+
+                # Inline rec: consume np_img GPU tensors immediately, then free them
+                if batch_rec_candidates:
+                    img_crops = [c["np_img"] for c in batch_rec_candidates]
+                    try:
+                        rec_res_list = run_ocr_inference(
+                            ocr_model.ocr, img_crops, det=False, tqdm_enable=False
+                        )[0]
+                        items_to_remove = []
+                        for idx, cand in enumerate(batch_rec_candidates):
+                            ocr_text, ocr_score = rec_res_list[idx]
+                            cand["text"] = ocr_text
+                            cand["score"] = float(f"{ocr_score:.3f}")
+                            should_remove = False
+                            if ocr_score < _OcrConf.min_confidence:
+                                should_remove = True
+                            else:
+                                b = cand["bbox"]
+                                lw, lh = b[2] - b[0], b[3] - b[1]
+                                if (
+                                    ocr_text in [
+                                        "（204号", "（20", "（2", "（2号", "（20号", "号", "（204",
+                                        "(cid:)", "(ci:)", "(cd:1)", "cd:)", "c)", "(cd:)", "c", "id:)",
+                                        ":)", "√:)", "√i:)", "-i:)", "-:", "i:)",
+                                    ] and ocr_score < 0.8 and lw < lh
+                                ):
+                                    should_remove = True
+                            cand.pop("np_img", None)
+                            cand.pop("lang", None)
+                            cand.pop("_need_ocr_rec", None)
+                            if should_remove:
+                                items_to_remove.append(cand)
+                        for item in items_to_remove:
+                            lst = ocr_res_list_dict["layout_res"]
+                            if item in lst:
+                                lst.remove(item)
+                        del rec_res_list
+                    except Exception:
+                        for cand in batch_rec_candidates:
+                            cand.pop("np_img", None)
+                            cand.pop("lang", None)
+                            cand.pop("_need_ocr_rec", None)
+                    del img_crops
+
+                del batch_rec_candidates
+                del batch_images, batch_results, batch_slice
+                torch.cuda.empty_cache()
+
+            del page_crop_info
+            torch.cuda.empty_cache()
+
         clean_vram(device, vram_threshold=8)
 
     def __call__(self, images_with_extra_info: list) -> list:
@@ -295,14 +364,14 @@ class FastBatchAnalyze(BatchAnalyze):
         pil_images = [image for image, _, _ in images_with_extra_info]
         np_images = [np.asarray(image) for image, _, _ in images_with_extra_info]
 
-        # ── layout(照调 mineru) ──
+        # -- layout (call mineru) --
         images_layout_res += run_layout_inference(
             self.model.layout_model.batch_predict,
             pil_images, batch_size=min(8, self.batch_ratio * LAYOUT_BASE_BATCH_SIZE),
         )
         clean_vram(self.model.device, vram_threshold=8)
 
-        # ── MFR(照调 mineru) ──
+        # -- MFR (call mineru) --
         if self.formula_enable:
             images_mfd_res = []
             for layout_res in images_layout_res:
@@ -324,9 +393,10 @@ class FastBatchAnalyze(BatchAnalyze):
             clean_vram(self.model.device, vram_threshold=8)
         else:
             for layout_res in images_layout_res:
-                layout_res[:] = [res for res in layout_res if res.get("label") != "inline_formula"]
+                layout_res[:] = [res for res in layout_res
+                                 if res.get("label") != "inline_formula"]
 
-        # ── 构建 OCR/表格数据结构(照调 mineru) ──
+        # -- Build OCR/table data structures (call mineru) --
         ocr_res_list_all_page = []
         table_res_list_all_page = []
         for index in range(len(np_images)):
@@ -367,22 +437,18 @@ class FastBatchAnalyze(BatchAnalyze):
                     "table_inline_objects": table_inline_objects.get(id(table_res), []),
                 })
 
-        # ── 表格识别(照调 mineru，原样复制原版 line 519-699) ──
+        # -- Table recognition (call mineru) --
         if self.table_enable:
             self._table_recognize_all(table_res_list_all_page, atom_model_manager)
 
-        # ── OCR-det(自己拥有：整页 GPU 常驻) ──
+        # -- OCR-det (own: whole-page GPU + inline rec per batch) --
+        # Rec is inlined inside _gpu_ocr_det_segment; no separate _ocr_rec_segment call.
         if self.text_ocr_det_batch_enabled:
             self._gpu_ocr_det_segment(ocr_res_list_all_page, atom_model_manager)
         else:
-            # 未开批处理 → 回退父类逐张 CPU 路径(通过临时实例组合较繁，直接复用父类逻辑不划算，
-            # 此分支罕见；保持正确性用原生单张路径)
             self._cpu_ocr_det_segment_fallback(ocr_res_list_all_page, atom_model_manager)
 
-        # ── OCR-rec(照调 mineru：img_crop 为 GPU tensor 时 FastTextRecognizer 直通 CRNN TRT) ──
-        self._ocr_rec_segment(images_layout_res, atom_model_manager)
-
-        # ── seal(照调 mineru) ──
+        # -- Seal (call mineru) --
         self._seal_segment(ocr_res_list_all_page, atom_model_manager)
 
         for ocr_res_list_dict in ocr_res_list_all_page:
@@ -391,15 +457,11 @@ class FastBatchAnalyze(BatchAnalyze):
             )
         return images_layout_res
 
-    # ────────────────────────────────────────────────────────────────────
-    #  以下 helper 逐字转录自 mineru BatchAnalyze.__call__ 的对应内联段落
-    #  (与 OCR 加速无关，仅因 OCR-det 夹在 __call__ 中间而必须一并拥有)。
-    #  内部只调 self._xxx / mineru 现成函数 → 低风险；升级时按标注源行号 diff。
-    # ────────────────────────────────────────────────────────────────────
+    # ---- Transcribed helpers (exact copies from mineru BatchAnalyze.__call__) ---
+    # Internal calls self._xxx / mineru functions only. Low risk; diff by source line.
 
     def _table_recognize_all(self, table_res_list_all_page, atom_model_manager):
-        """转录自原版 __call__ line 519-699(表格识别整段，去掉外层 if self.table_enable)。"""
-        # 图片旋转批量处理
+        """Transcribed from original __call__ line 519-699."""
         table_orientation_cls_model = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.TableOrientationCls,
         )
@@ -421,7 +483,6 @@ class FastBatchAnalyze(BatchAnalyze):
         except Exception as e:
             logger.warning(f"Table orientation classification failed: {e}, using original image")
 
-        # 表格分类
         table_cls_model = atom_model_manager.get_atom_model(atom_model_name=AtomicModel.TableCls)
         try:
             table_cls_model.batch_predict(
@@ -430,7 +491,6 @@ class FastBatchAnalyze(BatchAnalyze):
         except Exception as e:
             logger.warning(f"Table classification failed: {e}, using default model")
 
-        # 表格 OCR-det
         rec_img_lang_group = defaultdict(list)
         det_ocr_engine = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR, det_db_box_thresh=0.5,
@@ -458,7 +518,6 @@ class FastBatchAnalyze(BatchAnalyze):
                 )[0]
                 self._append_table_ocr_det_result(table_det_item, ocr_result, rec_img_lang_group)
 
-        # 表格 OCR-rec，按语言分批
         for _lang, rec_img_list in rec_img_lang_group.items():
             if not rec_img_list:
                 continue
@@ -475,11 +534,11 @@ class FastBatchAnalyze(BatchAnalyze):
                 ocr_text = self._normalize_table_ocr_rec_text(ocr_res[0])
                 ocr_result_item = [img_dict["dt_box"], html.escape(ocr_text), ocr_res[1]]
                 if table_res_list_all_page[img_dict["table_id"]].get("ocr_result"):
-                    table_res_list_all_page[img_dict["table_id"]]["ocr_result"].append(ocr_result_item)
+                    table_res_list_all_page[img_dict["table_id"]]["ocr_result"].append(
+                        ocr_result_item)
                 else:
                     table_res_list_all_page[img_dict["table_id"]]["ocr_result"] = [ocr_result_item]
 
-        # 内联对象回填
         for table_res_dict in table_res_list_all_page:
             if not self._table_supports_inline_objects(table_res_dict):
                 continue
@@ -494,13 +553,11 @@ class FastBatchAnalyze(BatchAnalyze):
                 ])
             self._sort_table_ocr_result(table_ocr_result)
 
-        # 无线表格
         wireless_table_model = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.WirelessTable,
         )
         wireless_table_model.batch_predict(table_res_list_all_page)
 
-        # 有线表格
         wired_table_res_list = []
         for table_res_dict in table_res_list_all_page:
             if (
@@ -523,7 +580,6 @@ class FastBatchAnalyze(BatchAnalyze):
                     table_res_dict["table_res"].get("html", None),
                 )
 
-        # HTML 清理
         for table_res_dict in table_res_list_all_page:
             html_code = table_res_dict["table_res"].get("html", "") or ""
             if "<table>" in html_code and "</table>" in html_code:
@@ -532,10 +588,8 @@ class FastBatchAnalyze(BatchAnalyze):
                 table_res_dict["table_res"]["html"] = html_code[start_index:end_index]
 
     def _cpu_ocr_det_segment_fallback(self, ocr_res_list_all_page, atom_model_manager):
-        """转录自原版 __call__ line 800-840(未开 text_ocr_det_batch 的逐张 CPU 路径)。
-        罕见分支；用 mineru 原生 crop_img/cvtColor/get_ocr_result_list 保正确。"""
-        from mineru.utils.model_utils import crop_img
-        from mineru.utils.ocr_utils import get_ocr_result_list
+        """Transcribed from original __call__ line 800-840 (no text_ocr_det_batch path)."""
+        from ..mineru_backend import crop_img, get_ocr_result_list
 
         for ocr_res_list_dict in tqdm(ocr_res_list_all_page, desc="OCR-det Predict"):
             _lang = ocr_res_list_dict["lang"]
@@ -546,13 +600,13 @@ class FastBatchAnalyze(BatchAnalyze):
                 new_image, useful_list = crop_img(
                     res, ocr_res_list_dict["np_img"], crop_paste_x=50, crop_paste_y=50
                 )
-                adjusted_mfdetrec_res = get_adjusted_mfdetrec_res(
+                adj = get_adjusted_mfdetrec_res(
                     ocr_res_list_dict["single_page_mfdetrec_res"], useful_list
                 )
                 bgr_image = cv2.cvtColor(new_image, cv2.COLOR_RGB2BGR)
-                det_image = self._get_masked_det_image(bgr_image, adjusted_mfdetrec_res)
+                det_image = self._get_masked_det_image(bgr_image, adj)
                 ocr_res = run_ocr_inference(
-                    ocr_model.ocr, det_image, mfd_res=adjusted_mfdetrec_res, rec=False,
+                    ocr_model.ocr, det_image, mfd_res=adj, rec=False,
                 )[0]
                 if ocr_res:
                     ocr_result_list = get_ocr_result_list(
@@ -560,70 +614,8 @@ class FastBatchAnalyze(BatchAnalyze):
                     )
                     ocr_res_list_dict["layout_res"].extend(ocr_result_list)
 
-    def _ocr_rec_segment(self, images_layout_res, atom_model_manager):
-        """转录自原版 __call__ line 842-921(OCR-rec 收集+批推理+写回)。
-        img_crop 为我们产出的 GPU tensor 时，FastTextRecognizer.__call__ 识别并直通 CRNN TRT。"""
-        need_ocr_lists_by_lang = {}
-        img_crop_lists_by_lang = {}
-        for layout_res in images_layout_res:
-            for layout_res_item in layout_res:
-                if not layout_res_item.get("_need_ocr_rec"):
-                    continue
-                if "np_img" in layout_res_item and "lang" in layout_res_item:
-                    lang = layout_res_item["lang"]
-                    if lang not in need_ocr_lists_by_lang:
-                        need_ocr_lists_by_lang[lang] = []
-                        img_crop_lists_by_lang[lang] = []
-                    need_ocr_lists_by_lang[lang].append((layout_res, layout_res_item))
-                    img_crop_lists_by_lang[lang].append(layout_res_item["np_img"])
-                    layout_res_item.pop("np_img", None)
-                    layout_res_item.pop("lang", None)
-                    layout_res_item.pop("_need_ocr_rec", None)
-
-        if len(img_crop_lists_by_lang) == 0:
-            return
-
-        from mineru.utils.ocr_utils import OcrConfidence as _OcrConf
-        for lang, img_crop_list in img_crop_lists_by_lang.items():
-            if len(img_crop_list) == 0:
-                continue
-            ocr_model = atom_model_manager.get_atom_model(
-                atom_model_name=AtomicModel.OCR, lang=lang
-            )
-            ocr_res_list = run_ocr_inference(
-                ocr_model.ocr, img_crop_list, det=False, tqdm_enable=True
-            )[0]
-            assert len(ocr_res_list) == len(need_ocr_lists_by_lang[lang]), (
-                f"ocr_res_list: {len(ocr_res_list)}, "
-                f"need_ocr_list: {len(need_ocr_lists_by_lang[lang])} for lang: {lang}"
-            )
-            items_to_remove = []
-            for index, (page_layout_res, layout_res_item) in enumerate(need_ocr_lists_by_lang[lang]):
-                ocr_text, ocr_score = ocr_res_list[index]
-                layout_res_item["text"] = ocr_text
-                layout_res_item["score"] = float(f"{ocr_score:.3f}")
-                should_remove = False
-                if ocr_score < _OcrConf.min_confidence:
-                    should_remove = True
-                else:
-                    b = layout_res_item["bbox"]
-                    lw, lh = b[2] - b[0], b[3] - b[1]
-                    if (
-                        ocr_text in [
-                            "（204号", "（20", "（2", "（2号", "（20号", "号", "（204",
-                            "(cid:)", "(ci:)", "(cd:1)", "cd:)", "c)", "(cd:)", "c", "id:)",
-                            ":)", "√:)", "√i:)", "−i:)", "−:", "i:)",
-                        ] and ocr_score < 0.8 and lw < lh
-                    ):
-                        should_remove = True
-                if should_remove:
-                    items_to_remove.append((page_layout_res, layout_res_item))
-            for page_layout_res, layout_res_item in items_to_remove:
-                if layout_res_item in page_layout_res:
-                    page_layout_res.remove(layout_res_item)
-
     def _seal_segment(self, ocr_res_list_all_page, atom_model_manager):
-        """转录自原版 __call__ line 923-970(印章 OCR)。"""
+        """Transcribed from original __call__ line 923-970 (seal OCR)."""
         seal_ocr_items = []
         for ocr_res_list_dict in ocr_res_list_all_page:
             for layout_res_item in ocr_res_list_dict["layout_res"]:

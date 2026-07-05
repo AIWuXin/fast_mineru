@@ -16,9 +16,10 @@ from pathlib import Path
 
 import torch
 
+from . import mineru_backend as mb
 from .config import PipelineConfig
 from .console import console, kv_panel, timing_table, Timer, rule
-from .engines import MFRDecoderTRT, DBNetTRT, CRNNTRT
+from .engines import MFRDecoderTRT, MFREncoderTRT, DBNetTRT, CRNNTRT
 from ._quiet import silence_mineru, suppress_c_stderr
 from ._stagetimer import StageTimer
 
@@ -30,15 +31,18 @@ class FastMineruPipeline:
         if self.config.quiet_mineru:
             silence_mineru()  # 静音 MinerU tqdm + loguru，rich 成为唯一进度层
         self._mfr_decoder: MFRDecoderTRT | None = None
+        self._mfr_encoder: MFREncoderTRT | None = None
         self._dbnet: DBNetTRT | None = None
         self._crnn: CRNNTRT | None = None
         self._injected = False          # MFR-decoder
+        self._mfr_enc_injected = False
         self._dbnet_injected = False
         self._crnn_injected = False
         self._ocr_gpu_injected = False
         self._ocr_det_gpu_injected = False
         self._whole_page_injected = False
         self._orig_batch_analyze = None
+        self._mfr_gpu_injected = False
 
         rule("fast_mineru 初始化")
         with console.status("[cyan]加载模型 / 反序列化引擎 / 预分配 / warmup ...", spinner="dots"):
@@ -52,12 +56,11 @@ class FastMineruPipeline:
     # ---- init 内部 ---------------------------------------------------------
     def _load_models_and_warmup(self):
         """用 batch_image_analyze 跑 warmup 页，一次性创建并预热全部 atom model。"""
-        from mineru.backend.pipeline.pipeline_analyze import batch_image_analyze
         from PIL import Image as PILImage
 
         n = max(1, self.config.warmup_pages)
         dummy = [PILImage.new("RGB", (1024, 768), "white") for _ in range(n)]
-        batch_image_analyze(
+        mb.warmup(
             [(img, True, self.config.lang) for img in dummy],
             formula_enable=self.config.formula_enable,
             table_enable=self.config.table_enable,
@@ -67,48 +70,22 @@ class FastMineruPipeline:
 
     def _get_mfr_head(self):
         """定位 pp_formulanet 的 head(PPFormulaNet_Head)。unimernet 无 generate_export 返回 None。"""
-        try:
-            from mineru.backend.pipeline.model_init import AtomModelSingleton
-            from mineru.backend.pipeline.model_list import AtomicModel
-            mfr = AtomModelSingleton().get_atom_model(
-                atom_model_name=AtomicModel.MFR, device=self.config.device)
-        except Exception:
-            return None
-        net = getattr(mfr, "net", None)
-        head = getattr(net, "head", None) if net is not None else None
-        if head is None or not hasattr(head, "generate_export"):
-            return None
-        return head
+        return mb.get_mfr_head(self.config.device)
 
     def _iter_ocr_models(self):
-        """遍历所有已创建的 OCR atom model 实例。
-
-        OCR 的 singleton key 含 det_db_box_thresh/unclip_ratio/merge/lang，MinerU 会用不同
-        参数建多个 OCR 实例(主路径 0.5/1.6/False、表格路径等)，它们各有独立 net。构造期注入
-        必须覆盖全部已建实例(warmup 已触发创建)，而非只按默认 key 取一个 —— 这正是替代
-        monkey-patch 用 get_atom_model 拦截"所有变体"的关键。
-        """
-        try:
-            from mineru.backend.pipeline.model_init import AtomModelSingleton
-            from mineru.backend.pipeline.model_list import AtomicModel
-        except Exception:
-            return []
-        models = getattr(AtomModelSingleton(), "_models", {})
-        out = []
-        for key, model in list(models.items()):
-            name = key[0] if isinstance(key, tuple) else key
-            if name == AtomicModel.OCR:
-                out.append(model)
-        return out
+        """遍历所有已创建的 OCR atom model 实例（覆盖 MinerU 建的所有 OCR 变体）。"""
+        return mb.iter_ocr_models()
 
     def _load_and_inject_engines(self):
         """反序列化各 TRT 引擎并**一次性显式注入**(构造期一次，无 get_atom_model 拦截、无全局状态)。"""
         self._inject_mfr_decoder()
+        self._inject_mfr_encoder()
         self._inject_dbnet()
         self._inject_crnn()
         self._inject_ocr_gpu()
         self._inject_ocr_det_gpu()
         self._inject_whole_page_gpu()
+        self._inject_mfr_gpu()
 
     def _inject_whole_page_gpu(self):
         """把 pipeline_analyze 里 BatchAnalyze 名字重绑到 FastBatchAnalyze(整页 GPU 常驻)。
@@ -121,12 +98,10 @@ class FastMineruPipeline:
             return
         try:
             from .models.fast_batch_analyze import FastBatchAnalyze
-            import mineru.backend.pipeline.pipeline_analyze as _pa
         except Exception as e:
             console.print(f"[yellow]⚠ 整页 GPU 常驻不可用: {e}")
             return
-        self._orig_batch_analyze = getattr(_pa, "BatchAnalyze", None)
-        _pa.BatchAnalyze = FastBatchAnalyze
+        self._orig_batch_analyze = mb.install_fast_batch_analyze(FastBatchAnalyze)
         self._whole_page_injected = True
         console.print("[green]✓ 整页 GPU 常驻 → FastBatchAnalyze(OCR-det crop/BGR/mask 上 GPU, rec 直通)")
 
@@ -173,6 +148,25 @@ class FastMineruPipeline:
             self._ocr_gpu_injected = True
             console.print(f"[green]✓ OCR-rec 预处理 → GPU csrc kernel({count} 实例)")
 
+    def _inject_mfr_gpu(self):
+        """把 FormulaRecognizer 的预处理(normalize+format+batch)提升为 GPU csrc kernel。
+        crop_margin(PIL 内容感知)保留 CPU。构造期一次注入。"""
+        cfg = self.config
+        if not cfg.use_mfr_gpu_preprocess:
+            return
+        try:
+            from .models.mfr import inject_mfr_gpu
+            mfr = mb.get_mfr_model(cfg.device)
+        except Exception as e:
+            console.print(f"[yellow]⚠ MFR GPU 预处理不可用: {e}")
+            return
+        try:
+            if inject_mfr_gpu(mfr):
+                self._mfr_gpu_injected = True
+                console.print("[green]✓ MFR 预处理 → GPU csrc kernel(1 实例)")
+        except Exception as e:
+            console.print(f"[yellow]⚠ MFR GPU 预处理注入失败: {e}")
+
     def _inject_mfr_decoder(self):
         cfg = self.config
         if not cfg.use_mfr_decoder_trt:
@@ -191,6 +185,37 @@ class FastMineruPipeline:
         head._fast_mineru_injected = True
         self._injected = True
         console.print(f"[green]✓ MFR-decoder → TensorRT(全程GPU零拷贝, max_batch={self._mfr_decoder.max_batch})")
+
+    def _get_mfr_backbone(self):
+        """定位 pp_formulanet 的 backbone(encoder) + DonutSwinModelOutput。返回 (backbone, cls) 或 (None,None)。"""
+        return mb.get_mfr_backbone(self.config.device)
+
+    def _inject_mfr_encoder(self):
+        """把 pp_formulanet backbone(encoder，卷积、固定 [B,1,384,384])前向替换为 TRT。
+        decoder 已单独 TRT；这里补上 encoder(MFR net 段 ~52% 耗时)。与 decoder 注入同构，构造期一次。"""
+        cfg = self.config
+        if not cfg.use_mfr_encoder_trt:
+            return
+        eng_p = cfg.mfr_encoder_engine
+        if eng_p is None or not eng_p.exists():
+            console.print(f"[yellow]⚠ MFR-encoder 引擎缺失，跳过: {eng_p}")
+            return
+        backbone, output_cls = self._get_mfr_backbone()
+        if backbone is None:
+            console.print("[yellow]⚠ 未找到 pp_formulanet backbone(是否 unimernet？)，跳过 MFR-encoder TRT")
+            return
+        if getattr(backbone.forward, "_fast_mineru_trt", False):
+            self._mfr_enc_injected = True
+            return
+        try:
+            self._mfr_encoder = MFREncoderTRT(str(eng_p), output_cls, debug=cfg.debug)
+        except Exception as e:
+            console.print(f"[yellow]⚠ MFR-encoder 引擎加载失败，跳过: {e}")
+            return
+        backbone._orig_forward = backbone.forward
+        backbone.forward = self._mfr_encoder.make_wrapper(backbone.forward)
+        self._mfr_enc_injected = True
+        console.print(f"[green]✓ MFR-encoder(backbone) → TensorRT(decoder 仍走同一 TRT, max_batch={self._mfr_encoder.max_batch})")
 
     def _inject_dbnet(self):
         cfg = self.config
@@ -250,6 +275,8 @@ class FastMineruPipeline:
             "device": dev,
             "VRAM": vram,
             "MFR-decoder TRT": yn(self._injected),
+            "MFR-encoder TRT": yn(self._mfr_enc_injected),
+            "MFR 预处理 GPU": yn(self._mfr_gpu_injected),
             "DBNet(det) TRT": yn(self._dbnet_injected),
             "CRNN(rec) TRT": yn(self._crnn_injected),
             "OCR-rec GPU 预处理": yn(self._ocr_gpu_injected),
@@ -264,9 +291,7 @@ class FastMineruPipeline:
     def process(self, pdf_path: str | Path) -> dict:
         """对单篇 PDF 做推理。无加载/无分配。返回 {name, output_dir, timing, process_ms, pages}。"""
         pdf_path = Path(pdf_path)
-        from mineru.cli.common import _process_output, prepare_env
-        from mineru.data.data_reader_writer import FileBasedDataWriter
-        from mineru.backend.pipeline.pipeline_analyze import doc_analyze_streaming
+        from .mineru_backend import _process_output, prepare_env, FileBasedDataWriter
 
         cfg = self.config
         timer = Timer()
@@ -278,7 +303,7 @@ class FastMineruPipeline:
         image_writer = FileBasedDataWriter(local_image_dir)
         md_writer = FileBasedDataWriter(local_md_dir)
 
-        from mineru.utils.enum_class import MakeMode
+        from .mineru_backend import MakeMode
 
         render = not cfg.no_render  # no_render: 跳过画框PDF/原PDF/markdown 渲染(不可加速的重活)
 
@@ -296,14 +321,27 @@ class FastMineruPipeline:
         # (避免多余 fd 重定向，也彻底消除与 loguru 的窗口冲突)。
         stderr_guard = (suppress_c_stderr() if (cfg.quiet_mineru and not cfg.no_render)
                         else contextlib.nullcontext())
+        # 每篇前关闭上次可能残留的 render workers(Windows spawn 模式下继承 CUDA
+        # context 极易触发 VRAM OOM)，并重试一次 BrokenProcessPool。
+        mb.shutdown_render_executor()
+
         t0 = time.perf_counter()
         with timer.section("analyze"), stderr_guard:
-            doc_analyze_streaming(
-                pdf_bytes_list=[pdf_bytes], image_writer_list=[image_writer],
-                lang_list=[cfg.lang], on_doc_ready=on_doc_ready,
-                parse_method=cfg.parse_method,
-                formula_enable=cfg.formula_enable, table_enable=cfg.table_enable,
-            )
+            for attempt in range(2):
+                try:
+                    mb.analyze_streaming(
+                        pdf_bytes_list=[pdf_bytes], image_writer_list=[image_writer],
+                        lang_list=[cfg.lang], on_doc_ready=on_doc_ready,
+                        parse_method=cfg.parse_method,
+                        formula_enable=cfg.formula_enable, table_enable=cfg.table_enable,
+                    )
+                except RuntimeError as e:
+                    if "BrokenProcessPool" in str(e) and attempt == 0:
+                        mb.shutdown_render_executor()
+                        continue
+                    raise
+                else:
+                    break
         process_ms = (time.perf_counter() - t0) * 1000
         stage_rows = stage_timer.rows(process_ms) if stage_timer else None
         if stage_timer:
@@ -328,16 +366,7 @@ class FastMineruPipeline:
 
     @staticmethod
     def _count_pages(pdf_bytes: bytes) -> int:
-        try:
-            import pypdfium2 as pdfium
-            from mineru.utils.pdfium_guard import (
-                open_pdfium_document, get_pdfium_document_page_count, close_pdfium_document)
-            doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
-            n = get_pdfium_document_page_count(doc)
-            close_pdfium_document(doc)
-            return n
-        except Exception:
-            return 0
+        return mb.count_pages(pdf_bytes)
 
     # ---- 清理 --------------------------------------------------------------
     def close(self):
@@ -348,6 +377,19 @@ class FastMineruPipeline:
                 head.generate_export = head._orig_generate_export
                 head._fast_mineru_injected = False
             self._injected = False
+        if self._mfr_enc_injected:
+            backbone, _ = self._get_mfr_backbone()
+            if backbone is not None and hasattr(backbone, "_orig_forward"):
+                backbone.forward = backbone._orig_forward
+                del backbone._orig_forward
+            self._mfr_enc_injected = False
+        if self._mfr_gpu_injected:
+            from .models.mfr import restore_mfr_gpu
+            try:
+                restore_mfr_gpu(mb.get_mfr_model(self.config.device))
+            except Exception:
+                pass
+            self._mfr_gpu_injected = False
         if self._dbnet_injected or self._crnn_injected:
             for ocr in self._iter_ocr_models():
                 for attr in ("text_detector", "text_recognizer"):
@@ -368,7 +410,5 @@ class FastMineruPipeline:
                 restore_ocr_det_gpu(ocr)
             self._ocr_det_gpu_injected = False
         if self._whole_page_injected:
-            import mineru.backend.pipeline.pipeline_analyze as _pa
-            if self._orig_batch_analyze is not None:
-                _pa.BatchAnalyze = self._orig_batch_analyze
+            mb.restore_batch_analyze(self._orig_batch_analyze)
             self._whole_page_injected = False

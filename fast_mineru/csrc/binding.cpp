@@ -9,6 +9,7 @@
 #include <pybind11/pybind11.h>
 #include <cuda_runtime.h>
 #include "ocr_preprocess.h"
+#include "mfr_preprocess.h"
 
 namespace py = pybind11;
 using std::uintptr_t;
@@ -110,4 +111,15 @@ PYBIND11_MODULE(_fast_mineru_core, m) {
     m.def("ocr_rec_resize_norm", &ocr_rec_resize_norm,
         py::arg("src_ptr"), py::arg("src_h"), py::arg("src_w"),
         py::arg("dst_ptr"), py::arg("resized_w"), py::arg("imgW"));
+
+    m.def("mfr_preprocess_batch", [](uintptr_t d_ptrs_ptr, uintptr_t d_hs_ptr,
+                                      uintptr_t d_ws_ptr, uintptr_t d_out_ptr, int N) {
+        launch_mfr_preprocess_batch(
+            reinterpret_cast<const uint8_t* const*>(d_ptrs_ptr),
+            reinterpret_cast<const int*>(d_hs_ptr),
+            reinterpret_cast<const int*>(d_ws_ptr),
+            reinterpret_cast<float*>(d_out_ptr),
+            N);
+    }, py::arg("d_ptrs_ptr"), py::arg("d_hs_ptr"), py::arg("d_ws_ptr"),
+       py::arg("d_out_ptr"), py::arg("N"));
 }

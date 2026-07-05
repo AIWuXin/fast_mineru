@@ -127,7 +127,23 @@ def ocr_rec_resize_norm(src: torch.Tensor, resized_w: int, imgW: int) -> torch.T
     return dst
 
 
+def mfr_preprocess_batch(images: list, device) -> torch.Tensor:
+    """MFR 公式预处理：batch 内逐个 formula crop 做 [resize→384,pad,grayscale,normalize]。
+    images: list of BGR uint8 [H,W,3] GPU tensors(各自尺寸)。返回 [N,1,384,384] float32。"""
+    N = len(images)
+    if N == 0:
+        return torch.empty(0, 1, 384, 384, dtype=torch.float32, device=device)
+    d_ptrs = torch.tensor([t.data_ptr() for t in images], dtype=torch.int64, device=device)
+    d_hs   = torch.tensor([t.size(0) for t in images], dtype=torch.int32, device=device)
+    d_ws   = torch.tensor([t.size(1) for t in images], dtype=torch.int32, device=device)
+    out = torch.empty(N, 1, 384, 384, dtype=torch.float32, device=device)
+    _core.mfr_preprocess_batch(d_ptrs.data_ptr(), d_hs.data_ptr(), d_ws.data_ptr(),
+                               out.data_ptr(), N)
+    return out
+
+
 __all__ = [
     "ocr_preprocess_image", "ocr_preprocess_batch", "ocr_crop_and_bgr",
     "ocr_apply_mask", "ocr_rec_warp", "ocr_rec_resize_norm",
+    "mfr_preprocess_batch",
 ]

@@ -13,9 +13,9 @@ from pathlib import Path
 
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
-from .config import PipelineConfig
-from .console import console, rule, timing_table
-from .pipeline import FastMineruPipeline
+from fast_mineru.config import PipelineConfig
+from fast_mineru.console import console, rule, timing_table
+from fast_mineru.pipeline import FastMineruPipeline
 
 
 def _disp_w(s: str) -> int:
@@ -79,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bench", action="store_true", help="打印每文档 stage 计时表")
     p.add_argument("--no-whole-page-gpu", action="store_true",
                    help="关闭整页 GPU 常驻(FastBatchAnalyze)，回退 mineru 原生 OCR 编排(A/B 对比用)")
+    p.add_argument("--no-mfr-enc-trt", action="store_true",
+                   help="关闭 MFR-encoder TRT，encoder 回退 torch(A/B 对比用)")
     return p
 
 
@@ -99,6 +101,7 @@ def main(argv=None) -> int:
         quiet_mineru=not args.verbose_mineru,
         stage_timing=args.bench,      # --bench 时细分各模型 stage wall
         use_whole_page_gpu=not args.no_whole_page_gpu,
+        use_mfr_encoder_trt=not args.no_mfr_enc_trt,
         debug=args.debug,
         output_dir=Path(args.output),
     )

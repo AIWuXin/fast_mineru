@@ -18,9 +18,11 @@ from .ocr import (
 )
 
 from .fast_batch_analyze import FastBatchAnalyze
+from .mfr import inject_mfr_gpu, restore_mfr_gpu
 
 __all__ = [
     "inject_ocr_gpu", "restore_ocr_gpu",
     "inject_ocr_det_gpu", "restore_ocr_det_gpu",
     "FastBatchAnalyze",
+    "inject_mfr_gpu", "restore_mfr_gpu",
 ]

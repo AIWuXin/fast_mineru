@@ -18,12 +18,13 @@ _DEFAULT_ENGINE_DIR = _PKG_ROOT.parent / "engines_bin"
 class PipelineConfig:
     # ---- 加速开关 ----
     use_mfr_decoder_trt: bool = True   # ★ 核心：MFR decoder 两段式 TRT(全程GPU零拷贝)
-    use_mfr_encoder_trt: bool = False  # 可选，端到端收益微(~9%)
+    use_mfr_encoder_trt: bool = True   # encoder(卷积,固定[B,1,384,384]) → TRT，MFR net 段 ~52% 耗时
     use_dbnet_trt: bool = True         # OCR-det TensorRT
     use_crnn_trt: bool = True          # OCR-rec TensorRT
     use_fast_ops: bool = True          # OCR-det 预处理 CUDA kernel
     use_ocr_gpu_preprocess: bool = True  # OCR-rec 逐 crop resize 走 GPU csrc kernel(替代 CPU cv2)
     use_whole_page_gpu: bool = True    # 整页 GPU 常驻(FastBatchAnalyze)：OCR-det crop/cvtColor/mask 上 GPU、rec crop 不落 CPU
+    use_mfr_gpu_preprocess: bool = True  # MFR normalize+format+batch → csrc kernel(保留 CPU crop_margin)
 
     # ---- 引擎路径(None → 用 engine_dir 下默认名) ----
     engine_dir: Path = _DEFAULT_ENGINE_DIR

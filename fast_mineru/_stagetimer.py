@@ -77,26 +77,17 @@ class StageTimer:
         self._patch_method(obj, "predict", stage)
 
     def install(self):
-        """包裹当前已建的所有 atom model + 拦截 get_atom_model 覆盖后续新建。"""
-        try:
-            from mineru.backend.pipeline.model_init import AtomModelSingleton
-            from mineru.backend.pipeline.pipeline_analyze import ModelSingleton
-        except Exception:
-            return self
-        mgr = AtomModelSingleton()
-        for key, obj in list(getattr(mgr, "_models", {}).items()):
-            aname = key[0] if isinstance(key, tuple) else key
+        """包裹当前已建的所有 atom model + MineruPipelineModel 的 layout/mfr 子模型。"""
+        from . import mineru_backend as mb
+        for aname, obj in mb.iter_atom_models():
             self._wrap_atom(obj, aname)
         # MineruPipelineModel 直接引用的 layout/mfr 子模型(不经 get_atom_model)
-        try:
-            for model in list(getattr(ModelSingleton(), "_models", {}).values()):
-                for attr, stage in (("layout_model", "1_layout"), ("mfr_model", "2_mfr")):
-                    sub = getattr(model, attr, None)
-                    if sub is not None:
-                        self._patch_method(sub, "batch_predict", stage)
-                        self._patch_method(sub, "predict", stage)
-        except Exception:
-            pass
+        _stage_by_attr = {"layout_model": "1_layout", "mfr_model": "2_mfr"}
+        for attr, sub in mb.iter_pipeline_layout_mfr():
+            stage = _stage_by_attr.get(attr)
+            if stage is not None:
+                self._patch_method(sub, "batch_predict", stage)
+                self._patch_method(sub, "predict", stage)
         return self
 
     def uninstall(self):
