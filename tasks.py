@@ -37,6 +37,22 @@ def build_ext(c, config="Release", clean=False):
     print("[fast_mineru] csrc 编译完成 → fast_mineru/csrc/")
 
 
+@task(name="build-engines")
+def build_engines(c, crnn="tf32", skip_export=False, skip_selfcheck=False):
+    """一键从零构建全部 5 个 TensorRT 引擎 → engines_bin/。
+
+    流程：架构自检 → 导出 ONNX → trtexec 编译。首次会自动下载 mineru 权重。
+    参数：--crnn tf32|fp16|both（默认 tf32）；--skip-export 仅编译；--skip-selfcheck 跳过自检。
+    """
+    args = f"--crnn {crnn}"
+    if skip_export:
+        args += " --skip-export"
+    if skip_selfcheck:
+        args += " --skip-selfcheck"
+    c.run(f"uv run --no-sync python engine_build/build_all.py {args}")
+    print("[fast_mineru] 引擎构建完成 → engines_bin/")
+
+
 @task
 def retag(c, version=None):
     """把 uv build 产出的 any-wheel 重打成本平台标签(cp312)。"""

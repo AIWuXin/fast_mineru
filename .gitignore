@@ -6,6 +6,11 @@ dist/
 _stubgen_tmp/
 cmake-build-*/
 
+# engine build 产物（脚本 engine_build/*.py 入库；onnx/log 不入库）
+engines_bin/*.onnx
+engine_build/*.log
+engines_bin/*.log
+
 # compiled ext (rebuilt from csrc)
 fast_mineru/csrc/*.pyd
 fast_mineru/csrc/*.so
@@ -27,4 +32,4 @@ __pycache__/
 .vscode/
 out/
 fast_mineru.egg-info/
-uv.lock
+# uv.lock 纳入版本控制（可复现构建：新机器克隆后 uv sync 用锁定版本，避免依赖漂移）

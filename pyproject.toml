@@ -12,17 +12,21 @@ dependencies = [
     "rich>=13.0",
     "tensorrt==10.12.0.36",
     "pillow>=11.0.0",
-    # MinerU pipeline 后端(pp_formulanet/OCR/layout)——editable 路径见 [tool.uv.sources]
-    "mineru[pipeline]",
+    # MinerU pipeline 后端(pp_formulanet/OCR/layout) —— 依赖 PyPI 原版，钉死 3.4.1 保证模型架构稳定。
+    # 注：Fast 只依赖原版就有的接口(generate_export/build_mfr_batch_groups/run_*_inference/
+    # AtomModelSingleton 等)；魔改版的 2 处解析增强已移植为 Fast 自己的注入层(models/mineru_enhance.py)。
+    "mineru[pipeline]==3.4.1",
     "six>=1.17.0",
 ]
 
-# dev：构建 wheel(uv build + retag) / 生成 .pyi 存根 / 跑基准。
+# dev：构建 wheel(uv build + retag) / 生成 .pyi 存根 / 跑基准 / 构建 TRT 引擎。
 [dependency-groups]
 dev = [
     "invoke>=3.0",
     "wheel>=0.45",
     "pytest>=8.0",
+    # 引擎构建期依赖：torch.onnx.export 需要 onnx；导出脚本数值自检用 onnxruntime(运行时已由 mineru 传递依赖提供)。
+    "onnx>=1.18.0",
 ]
 
 [build-system]
@@ -47,11 +51,10 @@ fast_mineru = [
 fast-mineru = "fast_mineru.cli:main"
 
 # torch 从 PyTorch cu128 索引拉取(默认 PyPI 是 +cpu 轮子，GPU 编排不可用)。
-# mineru 走本地 editable(复用 D:/project/MinerU 源码树 + 其构建缓存)。
+# mineru 走 PyPI 原版(见 dependencies)，不再依赖本地 MinerU 源码树。
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
-mineru = { path = "../MinerU", editable = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
