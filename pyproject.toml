@@ -17,6 +17,7 @@ dependencies = [
     # AtomModelSingleton 等)；魔改版的 2 处解析增强已移植为 Fast 自己的注入层(models/mineru_enhance.py)。
     "mineru[pipeline]==3.4.1",
     "six>=1.17.0",
+    "onnxscript>=0.7.1",
 ]
 
 # dev：构建 wheel(uv build + retag) / 生成 .pyi 存根 / 跑基准 / 构建 TRT 引擎。

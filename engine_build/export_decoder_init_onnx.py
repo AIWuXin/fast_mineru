@@ -95,7 +95,8 @@ print("开始导出首步 ONNX ...")
 torch.onnx.export(
     wrapper, (bos, attn, enc_hidden), OUT,
     input_names=in_names, output_names=out_names,
-    dynamic_axes=dynamic_axes, opset_version=OPSET, do_constant_folding=True,
+    dynamic_axes=dynamic_axes, opset_version=OPSET,
+    do_constant_folding=True, dynamo=False
 )
 print("✓ 导出完成:", OUT)
 

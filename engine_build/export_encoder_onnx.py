@@ -78,6 +78,7 @@ torch.onnx.export(
     },
     opset_version=OPSET,
     do_constant_folding=True,
+    dynamo=False
 )
 print("✓ 已导出:", OUT_ONNX)
 
