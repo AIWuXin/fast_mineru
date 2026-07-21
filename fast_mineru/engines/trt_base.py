@@ -9,7 +9,15 @@
 """
 from __future__ import annotations
 
+import threading
+
 import torch
+
+# 所有 TRT 引擎共享的全局执行锁。IExecutionContext 不是线程安全的；流式编排
+# (streaming.py)的 append 线程会在 finalize 里跑 post-OCR rec(走 CRNN TRT),
+# 与主线程 analyze 的引擎执行并发。TRT 在 GPU 上本就串行执行,一把全局锁
+# 跨引擎互斥无性能损失(锁内只有 enqueue,纳秒级开销),只保证线程安全。
+_EXEC_LOCK = threading.Lock()
 
 
 class TRTEngine:
@@ -50,7 +58,12 @@ class TRTEngine:
         """feed: name->torch cuda tensor。返回 name->torch cuda tensor(fp32 输出)。
 
         out_buffers: 可选，name->预分配 cuda tensor(减少每步 torch.empty)。形状不匹配则新建。
+        线程安全：全局执行锁互斥(见模块顶 _EXEC_LOCK)。
         """
+        with _EXEC_LOCK:
+            return self._run_locked(feed, out_buffers)
+
+    def _run_locked(self, feed: dict, out_buffers: dict | None = None) -> dict:
         trt = self._trt
         engine, ctx = self.engine, self.ctx
         for nm, t in feed.items():

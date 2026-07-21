@@ -16,6 +16,10 @@ dependencies = [
     # 注：Fast 只依赖原版就有的接口(generate_export/build_mfr_batch_groups/run_*_inference/
     # AtomModelSingleton 等)；魔改版的 2 处解析增强已移植为 Fast 自己的注入层(models/mineru_enhance.py)。
     "mineru[pipeline]==3.4.1",
+    # mineru 3.4.1 的 pdf_classify 使用 PdfImage.get_pos()(pypdfium2 4.x API)；5.x 已删除该方法，
+    # 导致 classify() 对所有文本型 PDF 抛异常并兜底为 'ocr' → 每篇文本 PDF 都被迫全页 OCR
+    # (1213 行 rec/14页)，这是"速度没有明显提升"的最大单一原因。钉 <5 恢复正确 auto 分类。
+    "pypdfium2>=4.30.0,<5",
     "six>=1.17.0",
     "onnxscript>=0.7.1",
 ]

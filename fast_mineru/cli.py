@@ -4,18 +4,17 @@
 
 流程：Pipeline(config) 构造一次(加载模型/引擎/预分配/warmup) → 每个 PDF 调 process()
 → rich 进度 + 每文档 stage 表 + process() 总耗时。区分 init 耗时(一次) 与 process 耗时。
+
+**Windows spawn 安全**：本模块顶层只 import 轻量标准库。MinerU 的 pdfium 渲染进程池
+在 Windows 上是 spawn 模式，每个 worker 都会重新 import __main__(即本文件)——若顶层
+import torch/tensorrt/fast_mineru，每个 worker 白付数秒~十几秒 import(每文档重建池一次)，
+debug 时还会被调试器 trace 放大数倍。重 import 全部收进 main()。
 """
 from __future__ import annotations
 
 import argparse
 import sys
 from pathlib import Path
-
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-
-from fast_mineru.config import PipelineConfig
-from fast_mineru.console import console, rule, timing_table
-from fast_mineru.pipeline import FastMineruPipeline
 
 
 def _disp_w(s: str) -> int:
@@ -67,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="MinerU 加速推理：单 PDF 或文件夹批处理，全程 GPU 的 MFR decoder TRT 加速")
     p.add_argument("target", help="单个 PDF 路径，或含多个 PDF 的文件夹(递归收集)")
     p.add_argument("--output", "-o", default="fast_mineru_out", help="输出目录(默认 fast_mineru_out)")
+    p.add_argument("--method", "-m", choices=["auto", "ocr", "txt"], default="auto",
+                   help="PDF 解析方式：auto=自动分类(默认,与原版一致)；ocr=强制全页 OCR；txt=强制文本层抽取")
     p.add_argument("--engine-dir", default=None, help="TRT 引擎目录(默认包内 engines_bin/)")
     p.add_argument("--no-mfr-dec-trt", action="store_true", help="关闭 MFR-decoder TRT(回退 torch)")
     p.add_argument("--mfr-precision", choices=["fp16", "fp32"], default="fp16")
@@ -77,14 +78,33 @@ def build_parser() -> argparse.ArgumentParser:
                    help="保留 MinerU 内部 tqdm/日志(默认静音，只留 fast_mineru 的 rich 输出)")
     p.add_argument("--debug", action="store_true", help="打印每组 TRT 解码计时")
     p.add_argument("--bench", action="store_true", help="打印每文档 stage 计时表")
-    p.add_argument("--no-whole-page-gpu", action="store_true",
-                   help="关闭整页 GPU 常驻(FastBatchAnalyze)，回退 mineru 原生 OCR 编排(A/B 对比用)")
+    p.add_argument("--whole-page-gpu", action="store_true",
+                   help="开启整页 GPU 常驻(FastBatchAnalyze)。实验性：实测比原生编排慢约四成，"
+                        "显存尖峰已由 rec 宽度预算分批根治，无需用它压显存")
     p.add_argument("--no-mfr-enc-trt", action="store_true",
                    help="关闭 MFR-encoder TRT，encoder 回退 torch(A/B 对比用)")
+    p.add_argument("--torch-rec", action="store_true",
+                   help="OCR-rec 整段回退 mineru 原生 torch(跳过 CRNN TRT + rec GPU 预处理，"
+                        "rec 走 CPU resize_norm)。det/layout/MFR 仍 TRT+GPU。用于隔离验证 rec 是否为显存锯齿来源")
+    p.add_argument("--no-prefetch", action="store_true",
+                   help="关闭渲染预取流水线(回退串行窗口循环,A/B 对比用)")
+    p.add_argument("--no-overlap-append", action="store_true",
+                   help="关闭逐页后处理与 analyze 重叠(A/B 对比用)")
+    p.add_argument("--clean-cache-threshold", type=float, default=7.0,
+                   help="窗口末 empty_cache 的 reserved 阈值(GB);0=恢复 mineru 原版每窗口全量清")
+    p.add_argument("--output-workers", type=int, default=4,
+                   help="输出进程池 worker 数(默认 4)")
     return p
 
 
 def main(argv=None) -> int:
+    # 重 import 收在 main() 内：spawn worker 重新 import 本模块时不会执行到这里。
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+
+    from fast_mineru.config import PipelineConfig
+    from fast_mineru.console import console, rule, timing_table
+    from fast_mineru.pipeline import FastMineruPipeline
+
     args = build_parser().parse_args(argv)
 
     target = Path(args.target)
@@ -100,8 +120,14 @@ def main(argv=None) -> int:
         no_render=args.no_render,
         quiet_mineru=not args.verbose_mineru,
         stage_timing=args.bench,      # --bench 时细分各模型 stage wall
-        use_whole_page_gpu=not args.no_whole_page_gpu,
+        use_whole_page_gpu=args.whole_page_gpu,
         use_mfr_encoder_trt=not args.no_mfr_enc_trt,
+        use_torch_rec=args.torch_rec,
+        parse_method=args.method,
+        prefetch_render=not args.no_prefetch,
+        overlap_append=not args.no_overlap_append,
+        clean_cache_threshold_gb=args.clean_cache_threshold,
+        output_workers=args.output_workers,
         debug=args.debug,
         output_dir=Path(args.output),
     )
@@ -114,25 +140,41 @@ def main(argv=None) -> int:
 
     rule("推理")
     results = []
-    total_process_ms = 0.0
     total_pages = 0
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   BarColumn(), TextColumn("{task.completed}/{task.total}"),
                   TimeElapsedColumn(), console=console) as prog:
         task = prog.add_task("处理文档", total=len(pdfs))
-        for pdf in pdfs:
-            prog.update(task, description=f"[cyan]{pdf.name}")
-            r = pipe.process(pdf)
-            results.append(r)
-            total_process_ms += r["process_ms"]
-            total_pages += r["pages"]
+
+        def _done(name):
+            prog.update(task, description=f"[cyan]{name}")
             prog.advance(task)
-            if args.bench and r.get("stage_rows"):
-                console.print(timing_table(
-                    f"{_ellipsis(r['name'], 36)}  ({r['pages']}p, process {r['process_ms']/1000:.2f}s)",
-                    r["stage_rows"], r["process_ms"]))
-                dh = lambda e: f"hit={getattr(e,'hit','-')} miss={getattr(e,'miss','-')}" if e else "-"
-                console.print(f"  [dim]TRT 命中: DBNet {dh(pipe._dbnet)} | CRNN {dh(pipe._crnn)}[/dim]")
+
+        if len(pdfs) > 1:
+            # 多文档真合批：单次 analyze_streaming 共享处理窗口 + 输出线程池重叠。
+            results = pipe.process_many(pdfs, on_doc_done=_done)
+        else:
+            prog.update(task, description=f"[cyan]{pdfs[0].name}")
+            results = [pipe.process(pdfs[0])]
+            prog.advance(task)
+
+        for r in results:
+            total_pages += r["pages"]
+        if args.bench:
+            for r in results:
+                if r.get("stage_rows"):
+                    total_ms = max(x["process_ms"] for x in results)
+                    console.print(timing_table(
+                        f"{_ellipsis(r['name'], 36)}  ({total_pages}p, process {total_ms/1000:.2f}s)"
+                        if len(results) > 1 else
+                        f"{_ellipsis(r['name'], 36)}  ({r['pages']}p, process {r['process_ms']/1000:.2f}s)",
+                        r["stage_rows"], total_ms if len(results) > 1 else r["process_ms"]))
+                    dh = lambda e: f"hit={getattr(e,'hit','-')} miss={getattr(e,'miss','-')}" if e else "-"
+                    console.print(f"  [dim]TRT 命中: DBNet {dh(pipe._dbnet)} | CRNN {dh(pipe._crnn)}[/dim]")
+                    break  # 合批只有一张总表(挂在首篇)
+
+    # 合批时各篇 process_ms 是"完成于"的累计时间点，总耗时取最后一篇的完成时间。
+    total_process_ms = max((r["process_ms"] for r in results), default=0.0)
 
     # ---- 汇总 ----
     rule("汇总")

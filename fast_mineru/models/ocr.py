@@ -25,6 +25,49 @@ import torch
 
 from ..csrc import ocr_preprocess_image, ocr_rec_resize_norm
 
+# rec 目标宽度量化步长(显存稳定)：CRNN TRT width profile 全动态 [16,2560]，任意宽合法。
+# 每批 stack 目标宽向上取整到 _REC_WIDTH_QUANTUM 的倍数 → TRT 只见有限种输入宽度，caching
+# allocator 的 buffer 尺寸从"几十上百种"收敛，reserved 碎片大幅收窄。pad 到量化宽(归一化后
+# 0 值，CRNN 训练/CTC 解码本就鲁棒)——仅 pad 稍多，内容(resized_w)不变。
+#
+# 步长选择(实测同一 PDF，vs 无量化的识别文本逐块对比)：
+#   步长   reserved峰值   相对无量化的差异
+#   16(≈无量化)  5.12GB   0
+#   96          3.00GB   2 块(一处公式乱码双方都错、一处 pad 后反而多识别出正确句号 → 实质无损)
+#   几何13档     1.93GB   4 块(多出 1 处数学符号音标变体 ī/ñ + 1 处直/弯引号样式，噪声级)
+# 默认 96：无损约束下的显存最优点(-41%)。调小→更贴无量化(显存回升)；调大→更省显存(可能引入
+# 单字符级 CTC 边界抖动，非整词丢失)。CRNN 宽方向下采样使 96 的倍数落在整特征步上，边界更稳。
+_REC_WIDTH_QUANTUM = 96
+
+# rec 单批"批大小×量化后宽度"像素预算。CRNN 的 CTC logits 是 [B, T≈W/4, V≈6625] fp32，
+# 大小 ∝ B×W：B=6 + W=2560(实测最宽档) 时单 logits 就 >1GB，postprocess 再复制一份，
+# 整文档 1213 行按宽度升序扫过时 reserved 一路爬到 ~4.7GB(每文档末尾的显存尖峰)。
+# 预算 5120 = 2×2560：最宽档 B 自动降到 2，logits ≤ ~350MB；窄行批次不变(仍 6)。
+# 只拆不并，窄行分批与原固定 batch_num 完全一致(零精度影响)，宽行只是 pad 更少。
+_REC_BW_BUDGET = 5120
+
+
+def _quantize_rec_width(w: int, max_width: int = 2560) -> int:
+    """把目标宽 w 向上取整到 _REC_WIDTH_QUANTUM 的倍数(不超过 max_width)。"""
+    q = _REC_WIDTH_QUANTUM
+    return min(((int(w) + q - 1) // q) * q, max_width)
+
+
+def _adaptive_rec_spans(widths, batch_num: int):
+    """按(已排序)宽度把 [0, n) 切成 (beg, end) 段：段内 数量×段最大宽 ≤ _REC_BW_BUDGET，
+    且数量 ≤ batch_num。widths 为按升序排列的量化后目标宽。只拆不并。"""
+    n = len(widths)
+    spans = []
+    beg = 0
+    while beg < n:
+        end = beg + 1
+        while end < n and end - beg < batch_num \
+                and (end - beg + 1) * widths[end] <= _REC_BW_BUDGET:
+            end += 1
+        spans.append((beg, end))
+        beg = end
+    return spans
+
 
 def _gpu_resize_norm_batch(recognizer, img_list, indices, beg, end):
     """对 img_list[indices[beg:end]] 做 GPU resize_norm，返回 [N,3,48,imgW] fp32 GPU tensor。
@@ -41,6 +84,8 @@ def _gpu_resize_norm_batch(recognizer, img_list, indices, beg, end):
         max_wh_ratio = max(max_wh_ratio, width_list[indices[k]])
     imgW = int(imgH * max_wh_ratio)
     imgW = max(min(imgW, recognizer.limited_max_width), recognizer.limited_min_width)
+    # 量化 pad 目标宽到固定档位(显存稳定)。resized_w(内容宽)不变，只多 pad 右侧。
+    imgW = min(_quantize_rec_width(imgW, recognizer.limited_max_width), recognizer.limited_max_width)
 
     outs = []
     for k in range(beg, end):
@@ -157,9 +202,22 @@ class FastTextRecognizer:
         rec_res = [["", 0.0]] * img_num
         batch_num = self.rec_batch_num
 
+        # 每图的"有效量化目标宽"(与 _gpu_resize_norm_batch 的 imgW 公式一致)，
+        # 供宽度预算分批：宽档自动缩小批，避免 CTC logits [B,W/4,V] 随 B×W 膨胀到 GB 级。
+        imgC, imgH, imgW0 = self.rec_image_shape
+        base_ratio = imgW0 / imgH
+        lim_min = getattr(self, "limited_min_width", 16)
+        lim_max = getattr(self, "limited_max_width", 2560)
+        eff_w = [
+            _quantize_rec_width(
+                max(min(int(imgH * max(base_ratio, width_list[i])), lim_max), lim_min),
+                lim_max)
+            for i in range(img_num)
+        ]
+        sorted_eff_w = [eff_w[indices[k]] for k in range(img_num)]
+
         try:
-            for beg in range(0, img_num, batch_num):
-                end = min(img_num, beg + batch_num)
+            for beg, end in _adaptive_rec_spans(sorted_eff_w, batch_num):
                 try:
                     inp = _gpu_resize_norm_batch(self, img_list, indices, beg, end)
                 except Exception:
@@ -184,21 +242,28 @@ class FastTextRecognizer:
 
     def _rec_preprocessed_gpu(self, img_list):
         """img_list 是已 resize_norm 的 [3,48,imgW] GPU tensor(来自 FastBatchAnalyze)。
-        按宽度排序分批、批内 pad 到批内最大宽 → net(CRNN TRT) → postprocess。
+        按宽度排序分批、批内 pad 到**量化后档位宽**(_quantize_rec_width) → net(CRNN TRT) →
+        postprocess。量化让 TRT 只见 ~13 种输入宽，caching allocator buffer 尺寸收敛，显存稳定。
         pad 值 0(归一化后中灰，CRNN 训练见过，CTC 解码鲁棒)。移植自 fast_ops.patcher line 1149。"""
         n = len(img_list)
         batch_num = self.rec_batch_num
         order = sorted(range(n), key=lambda i: img_list[i].shape[-1])
         rec_res = [["", 0.0]] * n
-        for start in range(0, n, batch_num):
-            idxs = order[start:start + batch_num]
+        max_w = getattr(self, "limited_max_width", 2560)
+        # 宽度预算分批(只拆不并)：宽档批缩小，CTC logits 显存有界；窄行分批不变。
+        sorted_w = [_quantize_rec_width(img_list[i].shape[-1], max_w) for i in order]
+        for start, stop in _adaptive_rec_spans(sorted_w, batch_num):
+            idxs = order[start:stop]
             w_max = max(img_list[i].shape[-1] for i in idxs)
+            # 量化 pad 目标宽到固定档位(显存稳定)：向上取整 → w_bucket >= w_max，所有图
+            # pad 到同一档位，内容不裁剪。TRT 只见 ~13 种输入宽，allocator buffer 尺寸收敛。
+            w_bucket = _quantize_rec_width(w_max, max_w)
             batch_list = []
             for i in idxs:
                 t = img_list[i]
                 w = t.shape[-1]
-                if w < w_max:
-                    padded = torch.zeros(t.shape[0], t.shape[1], w_max,
+                if w < w_bucket:
+                    padded = torch.zeros(t.shape[0], t.shape[1], w_bucket,
                                          dtype=t.dtype, device=t.device)
                     padded[:, :, :w] = t
                     t = padded

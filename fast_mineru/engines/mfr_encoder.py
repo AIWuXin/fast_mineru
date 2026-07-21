@@ -33,10 +33,14 @@ class MFREncoderTRT:
             self.max_batch = max_batch or 16
         self._hit = 0
         self._miss = 0
+        # 固定形状输出复用 buffer(输出 [B,144,2048] fp32)。仅不拆块路径复用：形状随 B
+        # 变化时 run() 内 shape 不匹配会自动新建(已有回退)，命中同 B 则免去每步 torch.empty。
+        # 拆块路径不用它(多块 torch.cat 前若共享同一 buffer 会互相覆盖)。
+        self._out_buf: dict = {}
 
-    def _infer(self, x: torch.Tensor) -> torch.Tensor | None:
+    def _infer(self, x: torch.Tensor, out_buffers: dict | None = None) -> torch.Tensor | None:
         try:
-            outs = self.engine.run({self._IN: x})
+            outs = self.engine.run({self._IN: x}, out_buffers=out_buffers)
             return outs[self._OUT]
         except Exception:
             return None
@@ -44,10 +48,16 @@ class MFREncoderTRT:
     def _run_trt(self, x: torch.Tensor) -> torch.Tensor | None:
         B = x.shape[0]
         if B <= self.max_batch:
-            return self._infer(x)
+            out = self._infer(x, out_buffers=self._out_buf)
+            # 回填本次输出，下次同形状调用即命中复用(run() 自身不回写 buffer)。
+            # 安全性：encoder 输出被 decoder 在同一 self.net(inp) 内同步消费完，
+            # 下次 encoder 调用前已无下游引用，复用同一块不会踩数据。
+            if out is not None:
+                self._out_buf[self._OUT] = out
+            return out
         chunks = []
         for i in range(0, B, self.max_batch):
-            out = self._infer(x[i:i + self.max_batch])
+            out = self._infer(x[i:i + self.max_batch])  # 拆块：不复用，避免 cat 前互相覆盖
             if out is None:
                 return None
             chunks.append(out)

@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 
 from . import mineru_backend as mb
+from . import streaming
 from .config import PipelineConfig
 from .console import console, kv_panel, timing_table, Timer, rule
 from .engines import MFRDecoderTRT, MFREncoderTRT, DBNetTRT, CRNNTRT
@@ -86,6 +87,14 @@ class FastMineruPipeline:
         self._inject_ocr_det_gpu()
         self._inject_whole_page_gpu()
         self._inject_mfr_gpu()
+        # 路径版 pdfium 加载器(注册过源路径的文档,渲染任务传路径免 112MB/次 pickle)
+        # + 放开渲染进程数硬上限。幂等,构造期一次。
+        mb.install_path_based_pdf_loader(max_processes=self.config.pdf_render_processes)
+        # 窗口末 empty_cache 阈值化(原版每窗口全量清 → cudaMalloc churn)
+        mb.install_conditional_clean_memory(self.config.clean_cache_threshold_gb)
+        # 渲染 worker 进程低优先级(与主进程 GPU 预处理并发时让核)
+        if self.config.low_priority_workers:
+            mb.install_render_pool_low_priority()
 
     def _inject_whole_page_gpu(self):
         """把 pipeline_analyze 里 BatchAnalyze 名字重绑到 FastBatchAnalyze(整页 GPU 常驻)。
@@ -130,7 +139,7 @@ class FastMineruPipeline:
     def _inject_ocr_gpu(self):
         """把 OCR text_recognizer 的预处理提升为 GPU 版(csrc kernel)，消除逐 crop CPU resize。"""
         cfg = self.config
-        if not cfg.use_ocr_gpu_preprocess:
+        if not cfg.use_ocr_gpu_preprocess or cfg.use_torch_rec:
             return
         try:
             from .models.ocr import inject_ocr_gpu
@@ -244,6 +253,9 @@ class FastMineruPipeline:
 
     def _inject_crnn(self):
         cfg = self.config
+        if cfg.use_torch_rec:
+            console.print("[yellow]⚠ use_torch_rec：OCR-rec 回退 torch，跳过 CRNN TRT 注入")
+            return
         if not cfg.use_crnn_trt or not cfg.crnn_engine.exists():
             if cfg.use_crnn_trt:
                 console.print(f"[yellow]⚠ CRNN 引擎缺失，跳过: {cfg.crnn_engine}")
@@ -324,24 +336,28 @@ class FastMineruPipeline:
         # 每篇前关闭上次可能残留的 render workers(Windows spawn 模式下继承 CUDA
         # context 极易触发 VRAM OOM)，并重试一次 BrokenProcessPool。
         mb.shutdown_render_executor()
+        mb.register_pdf_path(pdf_bytes, str(pdf_path))  # 渲染任务传路径免 112MB/次 pickle
 
         t0 = time.perf_counter()
-        with timer.section("analyze"), stderr_guard:
-            for attempt in range(2):
-                try:
-                    mb.analyze_streaming(
-                        pdf_bytes_list=[pdf_bytes], image_writer_list=[image_writer],
-                        lang_list=[cfg.lang], on_doc_ready=on_doc_ready,
-                        parse_method=cfg.parse_method,
-                        formula_enable=cfg.formula_enable, table_enable=cfg.table_enable,
-                    )
-                except RuntimeError as e:
-                    if "BrokenProcessPool" in str(e) and attempt == 0:
-                        mb.shutdown_render_executor()
-                        continue
-                    raise
-                else:
-                    break
+        try:
+            with timer.section("analyze"), stderr_guard:
+                for attempt in range(2):
+                    try:
+                        mb.analyze_streaming(
+                            pdf_bytes_list=[pdf_bytes], image_writer_list=[image_writer],
+                            lang_list=[cfg.lang], on_doc_ready=on_doc_ready,
+                            parse_method=cfg.parse_method,
+                            formula_enable=cfg.formula_enable, table_enable=cfg.table_enable,
+                        )
+                    except RuntimeError as e:
+                        if "BrokenProcessPool" in str(e) and attempt == 0:
+                            mb.shutdown_render_executor()
+                            continue
+                        raise
+                    else:
+                        break
+        finally:
+            mb.unregister_pdf_path(pdf_bytes)
         process_ms = (time.perf_counter() - t0) * 1000
         stage_rows = stage_timer.rows(process_ms) if stage_timer else None
         if stage_timer:
@@ -357,11 +373,131 @@ class FastMineruPipeline:
             "pages": pages,
         }
 
-    def process_many(self, paths: list) -> list:
-        """多文档批处理，复用同一组模型/引擎。"""
-        results = []
+    def process_many(self, paths: list, on_doc_done=None) -> list:
+        """多文档**真合批**：单次 analyze_streaming 传入全部文档，共享处理窗口。
+
+        与逐篇 process() 的区别：
+        - layout/MFR/OCR-det 跨文档共享批次(窗口默认 64 页)，GPU 利用率更高；
+        - pdfium 渲染进程池全程只建一次(逐篇模式每篇 shutdown+respawn 一次)；
+        - 每篇的 _process_output(pypdf 画框/原PDF落盘/md，纯 CPU ~4s/篇)丢到线程池，
+          与后续 window 的 GPU 推理重叠(pypdf 纯 Python，主线程 CUDA 同步等待时 GIL 空闲)。
+
+        精度不变量：每页计算与逐篇完全一致(layout/MFR/rec 均按图独立,rec 宽度预算分批
+        只按宽度切分,与文档边界无关)；输出仍按 doc_index 路由到各自目录。
+        on_doc_done(name) 回调用于进度条推进。返回与 process() 同构的 dict 列表，
+        其中 process_ms 为该篇推理完成的累计时间点(合批中各篇交错,无独立墙钟)。
+        """
+        cfg = self.config
+        paths = [Path(p) for p in paths]
+        if len(paths) <= 1:
+            return [self.process(p) for p in paths]
+
+        from concurrent.futures import ProcessPoolExecutor
+        from .mineru_backend import _process_output, prepare_env, FileBasedDataWriter, MakeMode
+
+        render = not cfg.no_render
+        docs = []
         for p in paths:
-            results.append(self.process(p))
+            pdf_bytes = p.read_bytes()
+            local_image_dir, local_md_dir = prepare_env(str(cfg.output_dir), p.stem, cfg.parse_method)
+            mb.register_pdf_path(pdf_bytes, str(p))   # 路径版加载器：渲染任务传路径免 IPC
+            docs.append({
+                "path": str(p),
+                "name": p.stem, "pdf_bytes": pdf_bytes,
+                "local_image_dir": local_image_dir, "local_md_dir": local_md_dir,
+                "image_writer": FileBasedDataWriter(local_image_dir),
+                "md_writer": FileBasedDataWriter(local_md_dir),
+                "done_ms": None, "output_error": None,
+            })
+
+        stage_timer = StageTimer(deep=cfg.debug).install() if cfg.stage_timing else None
+        stderr_guard = (suppress_c_stderr() if (cfg.quiet_mineru and not cfg.no_render)
+                        else contextlib.nullcontext())
+
+        # 输出进程池：pypdf/PIL/md 是纯 Python CPU 活,线程池被 GIL 卡死,进程池才能与
+        # 主进程 GPU 推理真重叠。pdf 从路径读,只 pickle middle_json。
+        output_pool = ProcessPoolExecutor(max_workers=cfg.output_workers)
+        output_futures = []
+        t0 = time.perf_counter()
+
+        def on_doc_ready(doc_index, model_list, middle_json, ocr_enable):
+            d = docs[doc_index]
+            d["done_ms"] = (time.perf_counter() - t0) * 1000
+            output_futures.append(output_pool.submit(
+                mb.process_output_task,
+                d["path"], d["name"], d["local_md_dir"], d["local_image_dir"],
+                render, middle_json, model_list,
+            ))
+            if on_doc_done:
+                on_doc_done(d["name"])
+
+        # 渲染池整个合批只关/建一次(逐篇模式每篇 respawn 一次,Windows spawn 下每篇白花数秒)。
+        mb.shutdown_render_executor()
+        import os as _os
+        _use_fast_streaming = _os.environ.get("FAST_MINERU_SERIAL_STREAMING", "0") != "1"
+        try:
+            with stderr_guard:
+                for attempt in range(2):
+                    try:
+                        if _use_fast_streaming:
+                            # 自己的流式编排(streaming.py):render(N+1) ∥ analyze(N) ∥ append(N-1)
+                            # 三路流水,消除渲染等待(~29%)与逐页后处理(~16%)的串行空转。
+                            streaming.analyze_streaming_fast(
+                                pdf_bytes_list=[d["pdf_bytes"] for d in docs],
+                                image_writer_list=[d["image_writer"] for d in docs],
+                                lang_list=[cfg.lang] * len(docs),
+                                pdf_path_list=[d["path"] for d in docs],
+                                on_doc_ready=on_doc_ready,
+                                parse_method=cfg.parse_method,
+                                formula_enable=cfg.formula_enable,
+                                table_enable=cfg.table_enable,
+                                prefetch=cfg.prefetch_render,
+                                overlap_append=cfg.overlap_append,
+                                low_priority=cfg.low_priority_workers,
+                                prefetch_chars=cfg.prefetch_page_chars,
+                            )
+                        else:
+                            # A/B 对照:mineru 原版串行循环(FAST_MINERU_SERIAL_STREAMING=1)
+                            mb.analyze_streaming(
+                                pdf_bytes_list=[d["pdf_bytes"] for d in docs],
+                                image_writer_list=[d["image_writer"] for d in docs],
+                                lang_list=[cfg.lang] * len(docs), on_doc_ready=on_doc_ready,
+                                parse_method=cfg.parse_method,
+                                formula_enable=cfg.formula_enable, table_enable=cfg.table_enable,
+                            )
+                    except RuntimeError as e:
+                        if "BrokenProcessPool" in str(e) and attempt == 0:
+                            mb.shutdown_render_executor()
+                            continue
+                        raise
+                    else:
+                        break
+        finally:
+            for d in docs:
+                mb.unregister_pdf_path(d["pdf_bytes"])
+
+        total_ms = (time.perf_counter() - t0) * 1000
+        # 等全部输出落盘；worker 异常会在此抛出(不静默丢输出)
+        for f in output_futures:
+            f.result()
+        output_pool.shutdown(wait=True)
+
+        stage_rows = stage_timer.rows(total_ms) if stage_timer else None
+        if stage_timer:
+            stage_timer.uninstall()
+
+        results = []
+        for d in docs:
+            results.append({
+                "stage_rows": None,
+                "name": d["name"],
+                "output_dir": str(d["local_md_dir"]),
+                "timing": None,
+                "process_ms": d["done_ms"] if d["done_ms"] is not None else total_ms,
+                "pages": self._count_pages(d["pdf_bytes"]),
+            })
+        if results:
+            results[0]["stage_rows"] = stage_rows   # 合批只有一张总表，挂在首篇上
         return results
 
     @staticmethod

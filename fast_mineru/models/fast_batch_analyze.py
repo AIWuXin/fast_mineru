@@ -62,6 +62,10 @@ from ..mineru_backend import (
 
 from ..csrc import ocr_apply_mask, ocr_crop_and_bgr
 
+# 批内 reserved 超过此阈值才 empty_cache(见下方批循环注释)。5GB：8GB 卡上 baseline ~3.1GB
+# (模型+TRT 引擎)，留 ~2GB 机动；低于阈值时 allocator 复用块，避免 cudaMalloc churn。
+_EMPTY_CACHE_ABOVE_BYTES = 5 * 1024**3
+
 
 # ---- GPU helpers (ported from fast_ops patcher) ------------------------------
 
@@ -209,8 +213,10 @@ class FastBatchAnalyze(BatchAnalyze):
 
     def _gpu_ocr_det_segment(self, ocr_res_list_all_page, atom_model_manager):
         """Whole-page GPU-resident OCR-det + per-batch inline rec.
-        Each det batch's np_img GPU tensors are immediately consumed by rec and freed
-        before the next batch starts -- VRAM peak = one batch, not the whole page."""
+        Crops are built lazily per det batch (not all up front), and each batch's crop
+        BGR + np_img GPU tensors are consumed by det/rec then freed before the next batch
+        -- VRAM peak = one batch's crops, not the whole page's. gpu_page stays resident
+        (single H2D per page) until the batch loop ends."""
         from ..mineru_backend import OcrConfidence as _OcrConf
 
         device = self.model.device
@@ -238,7 +244,11 @@ class FastBatchAnalyze(BatchAnalyze):
                 np.ascontiguousarray(np_img_np).copy()
             ).to(device=device, dtype=torch.uint8)
 
-            page_crop_info = []
+            # 只收集元信息(CPU，零 GPU 分配)：GPU crop 推迟到批内即时建，
+            # 使 VRAM 峰值 = 一个 batch 的 crop，而非整页全部 crop 常驻(8GB 卡上后者
+            # 会随页面 OCR 区域数线性飙升 —— 锯齿"飙升"的支配来源)。gpu_page 保持
+            # 常驻至批循环结束(单页 ~10MB，远小于所有 crop 之和)。
+            page_crop_meta = []
             for res in ocr_res_list_dict["ocr_res_list"]:
                 cx0, cy0, cx1, cy1 = _get_int_bbox(res)
                 paste_x, paste_y = 50, 50
@@ -249,22 +259,25 @@ class FastBatchAnalyze(BatchAnalyze):
                 adj = get_adjusted_mfdetrec_res(
                     ocr_res_list_dict["single_page_mfdetrec_res"], useful_list
                 )
-                crop_bgr = ocr_crop_and_bgr(gpu_page, cx0, cy0, cx1, cy1, paste_x, paste_y)
-                if mask_inline and adj:
-                    mask_boxes = [b["bbox"] for b in adj]
-                    mask_t = torch.tensor(mask_boxes, dtype=torch.int32, device=device)
-                    ocr_apply_mask(crop_bgr, mask_t)
-                page_crop_info.append((crop_bgr, useful_list, adj))
+                page_crop_meta.append((cx0, cy0, cx1, cy1, paste_x, paste_y, useful_list, adj))
 
-            del gpu_page
-
-            if not page_crop_info:
+            if not page_crop_meta:
+                del gpu_page
                 continue
 
-            total = len(page_crop_info)
+            total = len(page_crop_meta)
             for start in range(0, total, det_batch_size):
                 end = min(start + det_batch_size, total)
-                batch_slice = page_crop_info[start:end]
+                meta_slice = page_crop_meta[start:end]
+                # 仅为当前批即时建 crop(顺序/mask/坐标与整页预建时逐一致，仅推迟到批内)
+                batch_slice = []
+                for (cx0, cy0, cx1, cy1, paste_x, paste_y, useful_list, adj) in meta_slice:
+                    crop_bgr = ocr_crop_and_bgr(gpu_page, cx0, cy0, cx1, cy1, paste_x, paste_y)
+                    if mask_inline and adj:
+                        mask_boxes = [b["bbox"] for b in adj]
+                        mask_t = torch.tensor(mask_boxes, dtype=torch.int32, device=device)
+                        ocr_apply_mask(crop_bgr, mask_t)
+                    batch_slice.append((crop_bgr, useful_list, adj))
                 batch_images = [x[0] for x in batch_slice]
                 batch_results = run_ocr_inference(
                     ocr_model.text_detector.batch_predict,
@@ -343,10 +356,14 @@ class FastBatchAnalyze(BatchAnalyze):
                     del img_crops
 
                 del batch_rec_candidates
-                del batch_images, batch_results, batch_slice
-                torch.cuda.empty_cache()
+                del batch_images, batch_results, batch_slice, meta_slice
+                # 不逐批 empty_cache：caching allocator 会复用本批释放的块(宽度量化+宽度
+                # 预算分批后单批有界)，逐批 empty_cache 只会逼 allocator 反复 cudaMalloc，
+                # 拖慢后续所有 stage。reserved 由页末 empty_cache + clean_vram 兜底。
+                if torch.cuda.memory_reserved() > _EMPTY_CACHE_ABOVE_BYTES:
+                    torch.cuda.empty_cache()
 
-            del page_crop_info
+            del gpu_page, page_crop_meta
             torch.cuda.empty_cache()
 
         clean_vram(device, vram_threshold=8)
